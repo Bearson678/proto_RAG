@@ -8,7 +8,7 @@ from AgentStates.agentic_rag_states import WebSearchInput
 load_dotenv()
 serp_key = os.getenv("SERPAPI_API_KEY")
 
-def _web_search(query: str, num: int = 2) -> str:
+def _web_search(query: str, num: int = 5) -> str:
     if not serp_key:
         return "SerpAPI error: SERPAPI_API_KEY not set."
     try:

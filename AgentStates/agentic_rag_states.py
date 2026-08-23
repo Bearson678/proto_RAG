@@ -3,10 +3,9 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel,Field,StringConstraints,conint
 
-class AgentState(TypedDict):
-    """A dictionary representing the state of an agent."""
-
+class AgentState(TypedDict, total=False):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    research_rounds: int
     
 class RelevanceGrade(BaseModel):
     """Binary Score for relevance check."""

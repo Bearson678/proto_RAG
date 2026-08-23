@@ -4,6 +4,14 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage,AIMessage
 from langchain_core.output_parsers import StrOutputParser
 
+
+from langchain_core.messages import ToolMessage
+
+def _collect_tool_context(messages) -> str:
+    """Concatenate content from every ToolMessage gathered so far."""
+    parts = [str(m.content) for m in messages if isinstance(m, ToolMessage) and m.content]
+    return "\n\n---\n\n".join(parts)
+
 def agent(self, state: AgentState) -> Dict[str,Any]:
     """Decide whether to use the tool"""
     
@@ -18,6 +26,7 @@ def agent(self, state: AgentState) -> Dict[str,Any]:
         "- For factual lookup, call web_search.\n"
         "- Ensure that the searched advice is compliant with FDA regulations and ISO standards."
     ))
+
     
     model = self.llm.bind_tools(self.tools)
     response = model.invoke([sys,*messages])
@@ -31,34 +40,30 @@ def agent(self, state: AgentState) -> Dict[str,Any]:
     return {"messages":[response]}
 
 
-def grade_documents(self,state:AgentState) -> Literal["generate","rewrite"]:
-    """Check if retrieved docs are relevant to the question using Pydantic-validated output."""
-    
-    grader = self.llm.with_structed_output(RelevanceGrade)
+def grade_documents(self, state: AgentState) -> Literal["generate", "rewrite"]:
+    grader = self.llm.with_structured_output(RelevanceGrade)
     prompt = PromptTemplate(
         template=(
-            "You are a grader assessing relevance of a retrieved document to a user question.\n"
-            "Here is the retrieved document: \n\n{context}\n\n"
-            "Here is the user question: {question}\n"
-            "If the document contains keyword(s) or semantic meaning related to the user question,"
-            "grade it as relevant. Give a binary score 'yes' or 'no' ."
+            "You are grading whether retrieved web search results cover ALL distinct parts of a "
+            "user's question, not just one part.\n\n"
+            "Retrieved context so far:\n{context}\n\n"
+            "User question: {question}\n\n"
+            "First mentally break the question into its distinct parts. Grade 'yes' only if every "
+            "part has supporting evidence in the context. If any part is unaddressed, grade 'no'."
         ),
-        input_variables=["context","question"]
+        input_variables=["context", "question"],
     )
-    
-    print(f"_grade documents prompt: {prompt}")
-    
-    chain = prompt | grader
-    
     messages = state["messages"]
     question = messages[0].content if messages else ""
-    last_message = messages[-1] if messages else None
-    docs_content = getattr(last_message,"content","") if last_message else ""
-    
-    scored = chain.invoke({"question":question,"context":docs_content})
-    score = (scored.binary_Score or "").strip().lower()
-    print(f"_grade documents score: {score}")
-    return "generate" if score == "yes" else "rewrite"
+    context = _collect_tool_context(messages)
+
+    scored = (prompt | grader).invoke({"question": question, "context": context})
+    score = (scored.binary_score or "").strip().lower()
+
+    rounds = state.get("research_rounds", 0)
+    if score == "yes" or rounds >= 3:   # hard cap — avoids infinite rewrite loops
+        return "generate"
+    return "rewrite"
 
 
 def generate(self, state: AgentState) -> Dict[str, Any]:
@@ -84,13 +89,47 @@ def rewrite(self, state: AgentState) -> Dict[str, Any]:
     """Rewrite the question to improve retrieval."""
     messages = state["messages"]
     question = messages[0].content if messages else ""
+    context = _collect_tool_context(messages)   # from the earlier fix
 
     rewrite_prompt = (
-        "Look at the input and reason about the underlying semantic intent/meaning.\n"
-        "Here is the initial question:\n"
+        "Original question:\n"
         f"{question}\n\n"
-        "Formulate an improved question:"
+        "Context gathered so far (may be incomplete):\n"
+        f"{context}\n\n"
+        "Identify which distinct part(s) of the original question are NOT yet answered, and write a "
+        "focused follow-up search query targeting ONLY the missing part(s). Return only the query."
     )
-
     response = self.llm.invoke([HumanMessage(content=rewrite_prompt)])
-    return {"messages": [response]}
+
+    # Wrap as HumanMessage, not AIMessage: this becomes the next turn in the
+    # shared conversation history, and gemini-3.x rejects requests whose final
+    # message is an assistant turn ("model prefilling").
+    return {
+        "messages": [HumanMessage(content=response.content)],
+        "research_rounds": state.get("research_rounds", 0) + 1,
+    }
+
+
+def route_after_agent(state: AgentState) -> Literal["tools", "generate", "restricted"]:
+        """Route based on whether the agent called a tool, and whether prior
+        research already exists in state."""
+        messages = state["messages"]
+        last = messages[-1] if messages else None
+
+        tool_calls = getattr(last, "tool_calls", None) or []
+        if tool_calls:
+            return "tools"
+
+        # No tool call this turn. Did an earlier round already gather results?
+        has_prior_research = any(
+            isinstance(m, ToolMessage) and m.content for m in messages
+        )
+
+        if has_prior_research:
+            # Agent looped back after `rewrite`, decided it now has enough,
+            # and answered directly instead of calling web_search again.
+            # Don't discard the gathered context -- generate from it.
+            return "generate"
+
+        # No tool call, no prior research -> the request really is out of scope.
+        return "restricted"
