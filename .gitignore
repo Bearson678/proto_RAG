@@ -23,3 +23,9 @@ rad.json
 TestResults.xml
 #Environment settings file
 .env
+*.pdf
+*.csv
+*.png
+*.jpg
+*.jpeg
+
