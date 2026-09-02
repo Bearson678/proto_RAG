@@ -12,3 +12,8 @@ tiktoken
 rank-bm25
 pinecone
 langchain_google_genai
+pinecone
+pypdf
+pandas
+Pillow
+pytesseract
